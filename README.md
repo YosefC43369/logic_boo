@@ -60,3 +60,21 @@ sudo apt install -y mingw-w64 make python3
 x86_64-w64-mingw32-gcc --version
 # คาดหวัง: x86_64-w64-mingw32-gcc (GCC) 12.x.x ...
 ```
+macOS (Homebrew)
+```text
+brew install mingw-w64 make python3
+```
+ตรวจสอบ:
+```text
+x86_64-w64-mingw32-gcc --version
+```
+Windows + MSYS2
+```text
+# ใน MSYS2 MinGW64 shell
+pacman -S --needed mingw-w64-x86_64-gcc make python3
+```
+
+**หมายเหตุ:** ถ้าต้องการใช้ `MSVC (cl.exe)` แทน `MinGW` สามารถทำได้
+แต่ lb_evasion.c มี inline __asm__ ที่เป็น GCC syntax
+ต้องแยก indirect syscall stubs ออกเป็น .asm แยก + assemble ด้วย ml64.exe
+แนะนำให้ใช้ MinGW-w64 เพื่อความสะดวก
