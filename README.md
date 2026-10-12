@@ -26,7 +26,7 @@ logic_boo-main/
 └── INSTALL.md            ← เอกสารนี้
 ```
 
-# ไฟล์ output หลังจาก build:
+ไฟล์ output หลังจาก build:
 
 ```text
 build/
