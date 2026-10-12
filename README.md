@@ -38,6 +38,7 @@ deploy/
 
 ## 2. ความต้องการของระบบ
 
+```text
 | `**Component**` | `**เวอร์ชันขั้นต่ำ**`	| `**หมายเหตุ**` |
 |--------|--------|
 | `OS (build host)` | `Linux / macOS / Windows + WSL2` | `Cross-compile สำหรับ Windows` |
@@ -46,3 +47,4 @@ deploy/
 | `Python 3` | `>= 3.8` | `ใช้โดย setup.sh สำหรับ patch + hash injection` |
 sha256sum / shasum	ใด ๆ	มาพร้อม coreutils / macOS built-in
 Windows SDK (ntdll.lib)	ไม่จำเป็น	MinGW-w64 มี -lntdll อยู่แล้ว
+```
