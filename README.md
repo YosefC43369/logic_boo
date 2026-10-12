@@ -47,3 +47,16 @@ Python 3	>= 3.8	ใช้โดย setup.sh สำหรับ patch + hash inje
 sha256sum / shasum	ใด ๆ	มาพร้อม coreutils / macOS built-in
 Windows SDK (ntdll.lib)	ไม่จำเป็น	MinGW-w64 มี -lntdll อยู่แล้ว
 ```
+
+## 3. การติดตั้ง Toolchain
+
+Ubuntu / Debian
+```text
+sudo apt update
+sudo apt install -y mingw-w64 make python3
+```
+ตรวจสอบ:
+```text
+x86_64-w64-mingw32-gcc --version
+# คาดหวัง: x86_64-w64-mingw32-gcc (GCC) 12.x.x ...
+```
