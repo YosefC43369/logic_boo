@@ -35,3 +35,14 @@ deploy/
 ├── stage.dat             ← sentinel file ที่ต้องวางบน target
 └── deploy_checklist.txt  ← checklist step-by-step สำหรับ deploy
 ```
+
+## 2. ความต้องการของระบบ
+
+| `**Component**` | `**เวอร์ชันขั้นต่ำ**`	| `**หมายเหตุ**` |
+|--------|--------|
+| `OS (build host)` | `Linux / macOS / Windows + WSL2` | `Cross-compile สำหรับ Windows` |
+| `MinGW-w64 gcc` | `>= 9.0` `x86_64-w64-mingw32-gcc` |
+| `GNU make` | `>= 4.0` | `make` |
+| `Python 3` | `>= 3.8` | `ใช้โดย setup.sh สำหรับ patch + hash injection` |
+sha256sum / shasum	ใด ๆ	มาพร้อม coreutils / macOS built-in
+Windows SDK (ntdll.lib)	ไม่จำเป็น	MinGW-w64 มี -lntdll อยู่แล้ว
