@@ -12,7 +12,7 @@ pre-programmed conditions are met. Unlike standard malware that acts immediately
 ## 1. Project structure
 
 ```text
-**logic_boo-main/
+logic_boo-main/
 ├── boom.c                ← entry point + poll loop (ต้อง patch)
 ├── lb_c2.c / lb_c2.h    ← C2 communication layer (ไม่ต้องแก้)
 ├── lb_payload.c          ← payload execution engine (ต้อง patch)
@@ -23,5 +23,15 @@ pre-programmed conditions are met. Unlike standard malware that acts immediately
 ├── lb_config.ini         ← runtime configuration
 ├── Makefile              ← [ใหม่/แทน] full build system
 ├── setup.sh              ← [ใหม่] automated build + deploy prep script
-└── INSTALL.md            ← เอกสารนี้**
+└── INSTALL.md            ← เอกสารนี้
+```
+
+# ไฟล์ output หลังจาก build:
+
+```text
+build/
+└── lb.exe                ← binary ที่ deploy บน target
+deploy/
+├── stage.dat             ← sentinel file ที่ต้องวางบน target
+└── deploy_checklist.txt  ← checklist step-by-step สำหรับ deploy
 ```
